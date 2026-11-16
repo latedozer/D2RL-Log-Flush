@@ -1,0 +1,12 @@
+# Background Log Flush: plugin log lines no longer make the game wait for the disk.
+# D2RLoader flushes every plugin's log file to disk after each line, on the thread that wrote it;
+# on a slow drive that froze the game for a quarter of a second or more. With this plugin the line
+# is still written at once, and the flush is done on a background thread.
+# Close the game before editing; changes apply on the next start.
+# Console (Ctrl + `): "logflush" shows how many lines did not wait for the disk.
+
+# false = log lines are flushed as before (the plugin does nothing)
+enabled = true
+# How long the background thread waits after a line before flushing, in milliseconds (0-2000).
+# Lines that come in the meantime are flushed together, once per log file.
+batch_ms = 500
