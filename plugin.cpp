@@ -59,36 +59,16 @@ int Clamp(int value, int low, int high) {
 void ParseConfig(const char* text) {
 	for (const char* line = text; line != nullptr && *line != '\0';) {
 		const char* end = strchr(line, '\n');
-		char        buffer[256];
-		const size_t length = end != nullptr ? static_cast<size_t>(end - line) : strlen(line);
-		const size_t copy   = length < sizeof(buffer) - 1 ? length : sizeof(buffer) - 1;
-		memcpy(buffer, line, copy);
-		buffer[copy] = '\0';
-		line         = end != nullptr ? end + 1 : nullptr;
-
-		char* p = buffer;
-		while (*p == ' ' || *p == '\t') {
-			++p;
-		}
-		if (*p == '#' || *p == '[' || *p == '\0') {
+		char        buffer[256], key[32], value[32];
+		snprintf(buffer, sizeof(buffer), "%.*s", static_cast<int>(end != nullptr ? end - line : static_cast<ptrdiff_t>(strlen(line))), line);
+		line = end != nullptr ? end + 1 : nullptr;
+		// "key = value"; comments, [sections] and blank lines do not match
+		if (sscanf(buffer, " %31[a-z_] = %31s", key, value) != 2) {
 			continue;
 		}
-		char* equals = strchr(p, '=');
-		if (equals == nullptr) {
-			continue;
-		}
-		char* keyEnd = equals;
-		while (keyEnd > p && (keyEnd[-1] == ' ' || keyEnd[-1] == '\t')) {
-			--keyEnd;
-		}
-		*keyEnd     = '\0';
-		char* value = equals + 1;
-		while (*value == ' ' || *value == '\t') {
-			++value;
-		}
-		if (strcmp(p, "enabled") == 0) {
+		if (strcmp(key, "enabled") == 0) {
 			g_config.enabled = strncmp(value, "true", 4) == 0 || *value == '1' ? 1 : 0;
-		} else if (strcmp(p, "batch_ms") == 0) {
+		} else if (strcmp(key, "batch_ms") == 0) {
 			g_config.batchMs = Clamp(atoi(value), 0, 2000);
 		}
 	}
@@ -116,9 +96,14 @@ std::atomic<bool> g_on { false };
 
 std::atomic<uintptr_t> g_logSite { 0 }; // where D2RCore's log writer flushes (for the log)
 
-// flushes waiting for the background thread (duplicated handles: the logger closes its own)
+// flushes waiting for the background thread: one per log file (a duplicated handle, because
+// the logger closes its own), with a hash of the file's name to merge later lines into it
+struct Pending {
+	HANDLE   file;
+	uint64_t name;
+};
 constexpr int kMaxQueue = 1024;
-HANDLE        g_queue[kMaxQueue];
+Pending       g_queue[kMaxQueue];
 int           g_queued    = 0;
 SRWLOCK       g_queueLock = SRWLOCK_INIT;
 HANDLE        g_wake      = nullptr;
@@ -127,7 +112,7 @@ HANDLE        g_thread    = nullptr;
 
 std::atomic<uint64_t> g_deferred { 0 };  // log line flushes taken off the logging thread
 std::atomic<uint64_t> g_flushes { 0 };   // flushes the background thread made
-std::atomic<uint64_t> g_merged { 0 };    // deferred flushes covered by another one of the same file
+std::atomic<uint64_t> g_merged { 0 };    // log lines whose file was already waiting for a flush
 std::atomic<uint64_t> g_dropped { 0 };   // queue full: line written, not waited for
 std::atomic<uint64_t> g_passed { 0 };    // flushes left as they were (not a log file)
 std::atomic<uint64_t> g_totalUs { 0 };   // time the background flushes took
@@ -145,56 +130,61 @@ uint64_t NowUs() {
 
 // ---------------------------------------------------------------- which flushes are log lines
 
-// 1 = a file in a d2rloader\logs folder ending in .log, 0 = something else, -1 = could not tell
-int IsLogFile(HANDLE file) {
+// True for a .log file in a d2rloader\logs folder; `name` is then a hash of its full name.
+bool IsLogFile(HANDLE file, uint64_t& name) {
 	wchar_t     path[1024];
 	const DWORD length = GetFinalPathNameByHandleW(file, path, static_cast<DWORD>(sizeof(path) / sizeof(path[0])), FILE_NAME_NORMALIZED);
 	if (length == 0 || length >= sizeof(path) / sizeof(path[0])) {
-		return -1;
+		return false;
 	}
+	name = 14695981039346656037ull;
 	for (DWORD i = 0; i < length; ++i) {
 		path[i] = static_cast<wchar_t>(towlower(path[i]));
+		name    = (name ^ path[i]) * 1099511628211ull;
 	}
-	const bool inLogs = wcsstr(path, L"\\d2rloader\\logs\\") != nullptr;
-	const bool isLog  = length > 4 && wcscmp(path + length - 4, L".log") == 0;
-	return inLogs && isLog ? 1 : 0;
-}
-
-bool Enqueue(HANDLE file) {
-	AcquireSRWLockExclusive(&g_queueLock);
-	const bool wasEmpty = g_queued == 0;
-	const bool room     = g_queued < kMaxQueue;
-	if (room) {
-		g_queue[g_queued++] = file;
-	}
-	ReleaseSRWLockExclusive(&g_queueLock);
-	if (room && wasEmpty) {
-		SetEvent(g_wake);
-	}
-	return room;
+	return wcsstr(path, L"\\d2rloader\\logs\\") != nullptr && length > 4 && wcscmp(path + length - 4, L".log") == 0;
 }
 
 // D2RCore's FlushFileBuffers from now on.
 BOOL WINAPI DeferredFlush(HANDLE file) {
-	const auto ret = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+	const auto ret  = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+	uint64_t   name = 0;
 	// every flush is checked by file name: only log files are left to the background thread
-	if (!g_on.load(std::memory_order_acquire) || ret < g_coreStart || ret >= g_coreEnd || IsLogFile(file) != 1) {
+	if (!g_on.load(std::memory_order_acquire) || ret < g_coreStart || ret >= g_coreEnd || !IsLogFile(file, name)) {
 		g_passed.fetch_add(1, std::memory_order_relaxed);
 		return g_realFlush(file);
 	}
 	if (g_logSite.load(std::memory_order_relaxed) == 0) {
 		g_logSite.store(ret, std::memory_order_relaxed);
 	}
-	HANDLE copy = nullptr;
-	if (!DuplicateHandle(GetCurrentProcess(), file, GetCurrentProcess(), &copy, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
-		g_passed.fetch_add(1, std::memory_order_relaxed);
-		return g_realFlush(file);
+	// A file already waiting is flushed whole, this line with it. Otherwise it joins the queue.
+	AcquireSRWLockExclusive(&g_queueLock);
+	bool merged = false;
+	for (int i = 0; i < g_queued && !merged; ++i) {
+		merged = g_queue[i].name == name;
 	}
-	if (Enqueue(copy)) {
-		g_deferred.fetch_add(1, std::memory_order_relaxed);
-	} else {
-		CloseHandle(copy); // the line is written; it just is not waited for
-		g_dropped.fetch_add(1, std::memory_order_relaxed);
+	const bool room   = !merged && g_queued < kMaxQueue;
+	HANDLE     copy   = nullptr;
+	const bool queued = room && DuplicateHandle(GetCurrentProcess(), file, GetCurrentProcess(), &copy, 0, FALSE, DUPLICATE_SAME_ACCESS);
+	if (queued) {
+		g_queue[g_queued++] = { copy, name };
+	}
+	const bool wake = queued && g_queued == 1;
+	ReleaseSRWLockExclusive(&g_queueLock);
+
+	if (room && !queued) {
+		g_passed.fetch_add(1, std::memory_order_relaxed);
+		return g_realFlush(file); // could not keep a handle: flush here, as before
+	}
+	if (!room && !merged) {
+		g_dropped.fetch_add(1, std::memory_order_relaxed); // queue full: the line is written; it just is not waited for
+		return TRUE;
+	}
+	g_deferred.fetch_add(1, std::memory_order_relaxed);
+	if (merged) {
+		g_merged.fetch_add(1, std::memory_order_relaxed);
+	} else if (wake) {
+		SetEvent(g_wake);
 	}
 	return TRUE;
 }
@@ -202,41 +192,23 @@ BOOL WINAPI DeferredFlush(HANDLE file) {
 // ---------------------------------------------------------------- the background thread
 
 void FlushPending() {
-	static HANDLE batch[kMaxQueue];
+	static Pending batch[kMaxQueue];
 	AcquireSRWLockExclusive(&g_queueLock);
 	const int count = g_queued;
-	memcpy(batch, g_queue, static_cast<size_t>(count) * sizeof(HANDLE));
+	memcpy(batch, g_queue, static_cast<size_t>(count) * sizeof(Pending));
 	g_queued = 0;
 	ReleaseSRWLockExclusive(&g_queueLock);
 
-	struct Key {
-		DWORD volume, high, low;
-	};
-	static Key done[kMaxQueue];
-	int        doneCount = 0;
 	for (int i = 0; i < count; ++i) {
-		BY_HANDLE_FILE_INFORMATION info {};
-		const bool known = GetFileInformationByHandle(batch[i], &info) != 0;
-		bool       seen  = false;
-		for (int j = 0; known && j < doneCount && !seen; ++j) {
-			seen = done[j].volume == info.dwVolumeSerialNumber && done[j].high == info.nFileIndexHigh && done[j].low == info.nFileIndexLow;
+		const uint64_t start = NowUs();
+		g_realFlush(batch[i].file);
+		const uint64_t took = NowUs() - start;
+		g_flushes.fetch_add(1, std::memory_order_relaxed);
+		g_totalUs.fetch_add(took, std::memory_order_relaxed);
+		if (took > g_worstUs.load(std::memory_order_relaxed)) {
+			g_worstUs.store(took, std::memory_order_relaxed); // only this thread writes it
 		}
-		if (seen) {
-			g_merged.fetch_add(1, std::memory_order_relaxed);
-		} else {
-			const uint64_t start = NowUs();
-			g_realFlush(batch[i]);
-			const uint64_t took = NowUs() - start;
-			g_flushes.fetch_add(1, std::memory_order_relaxed);
-			g_totalUs.fetch_add(took, std::memory_order_relaxed);
-			uint64_t worst = g_worstUs.load(std::memory_order_relaxed);
-			while (took > worst && !g_worstUs.compare_exchange_weak(worst, took)) {
-			}
-			if (known) {
-				done[doneCount++] = { info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow };
-			}
-		}
-		CloseHandle(batch[i]);
+		CloseHandle(batch[i].file);
 	}
 }
 
@@ -327,10 +299,7 @@ bool Install() {
 		Log("could not start the background thread - nothing done");
 		return false;
 	}
-	using DescribeFn = HRESULT(WINAPI*)(HANDLE, PCWSTR);
-	if (const auto describe = reinterpret_cast<DescribeFn>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription")))) {
-		describe(g_thread, L"BgLogFlush"); // the thread's name in tools such as Lag Finder
-	}
+	SetThreadDescription(g_thread, L"BgLogFlush"); // the thread's name in tools such as Lag Finder
 	g_on.store(true, std::memory_order_release);
 	if (!WriteSlot(reinterpret_cast<void*>(&DeferredFlush))) {
 		g_on.store(false);
@@ -363,7 +332,7 @@ constexpr D2RL::PluginInfo kPluginInfo {
 	.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 	.id          = "background-log-flush",
 	.name        = "Background Log Flush",
-	.version     = "1.0.0",
+	.version     = "1.0.1",
 	.author      = "Latedozer",
 	.description = "Plugin log lines no longer make the game wait for the disk: D2RLoader's flush after each line is done on a background thread.",
 	.flags       = D2RL::PluginFlags::Shared,

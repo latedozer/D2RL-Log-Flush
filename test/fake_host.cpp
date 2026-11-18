@@ -157,7 +157,8 @@ int main(int argc, char** argv) {
 	HostLog(&other, "before: a line with the slow disk");
 	Check(NowMs() - start >= 280, "without the plugin a log line waits for the slow disk (300 ms)");
 
-	g_config = disabled ? "enabled = false\n" : "enabled = true\nbatch_ms = 200\n";
+	// shaped like the real settings file: comments, a section, a comment after a value, CRLF
+	g_config = disabled ? "# settings\r\nenabled = false\r\n" : "# Background Log Flush\r\n\r\n[general]\r\nenabled = true   # on\r\nbatch_ms = 200\r\n";
 	static D2RL::PluginApi api {};
 	api.apiSize                = D2RL::PluginApiSize;
 	api.logInfo = api.logWarn = api.logError = HostLog;
@@ -191,6 +192,7 @@ int main(int argc, char** argv) {
 
 	Check(*slot != reinterpret_cast<void*>(&SlowFlush), "D2RCore's import of FlushFileBuffers now points at the plugin");
 	Check(ReadFileText(ownLog).find("found D2RCore's log writer") != std::string::npos, "the plugin found the log writer from its own first line");
+	Check(ReadFileText(ownLog).find("(200 ms after a line)") != std::string::npos, "the settings were read (batch_ms = 200)");
 
 	// a burst of lines from another plugin, as at the moment of joining a game
 	const int flushesBefore = g_slowFlushes.load();
@@ -208,7 +210,12 @@ int main(int argc, char** argv) {
 	Check(worst < 50, "with the plugin no log line waits for the disk (each under 50 ms, the disk takes 300)");
 	Check(g_slowOnMain.load() == mainBefore, "no flush of a log line ran on the logging thread");
 
-	Sleep(1500); // the background thread: 200 ms gathering, then one 300 ms flush per file
+	// the background thread: 200 ms gathering, then one 300 ms flush per file. Wine can hold a
+	// thread back for a moment, so give it up to 5 s; a flush that was never started fails anyway.
+	Sleep(1500);
+	for (int waited = 1500; waited < 5000 && g_slowFlushes.load() == flushesBefore; waited += 100) {
+		Sleep(100);
+	}
 	const int burstFlushes = g_slowFlushes.load() - flushesBefore;
 	printf("  [host] flushes for the 30 lines: %d\n", burstFlushes);
 	Check(burstFlushes >= 1 && burstFlushes <= 4, "the 30 lines were flushed in a few background flushes, not 30");
